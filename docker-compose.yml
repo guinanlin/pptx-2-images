@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  pptx_converter_service:
+    build:
+      context: . # Build context is the current directory where Dockerfile is located
+      dockerfile: Dockerfile
+    ports:
+      - "8131:8000" # Maps host port 8131 to container port 8000
+    # Optional: If you need persistent storage for logs or specific configurations,
+    # you can uncomment and adjust the volumes section.
+    # For this specific service, temporary files are handled internally and cleaned up.
+    # volumes:
+    #   - ./logs:/app/logs
+    restart: unless-stopped # Automatically restart the service if it stops, unless explicitly stopped
+    environment:
+      # You can add any environment variables needed by your FastAPI app here.
+      # For example, API keys, database connection strings, etc.
+      - APP_ENV=production
+      - DEBUG=false
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
