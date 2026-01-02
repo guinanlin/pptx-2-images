@@ -56,7 +56,44 @@ docker compose ps
 docker compose logs -f
 ```
 
-### 2. 验证服务运行
+### 2. 重新构建和重启服务
+
+当代码或配置更新后，需要重新构建镜像并重启服务：
+
+**方法一：停止后重新构建并启动（推荐）**
+```bash
+# 停止并删除容器
+docker compose down
+
+# 重新构建镜像
+docker compose build
+
+# 启动服务
+docker compose up -d
+```
+
+**方法二：直接构建并启动（一步完成）**
+```bash
+# 停止现有服务，重新构建并启动
+docker compose up -d --build
+```
+
+**方法三：仅重启服务（不重新构建）**
+```bash
+# 如果只是重启服务而不需要重新构建镜像
+docker compose restart
+```
+
+**查看构建和启动状态**
+```bash
+# 查看服务状态
+docker compose ps
+
+# 查看服务日志
+docker compose logs -f
+```
+
+### 3. 验证服务运行
 
 访问以下URL验证服务是否正常运行：
 
@@ -64,7 +101,7 @@ docker compose logs -f
 - **API文档**: http://localhost:8131/docs
 - **根路径**: http://localhost:8131/
 
-### 3. 使用API转换文件
+### 4. 使用API转换文件
 
 #### 使用curl命令
 

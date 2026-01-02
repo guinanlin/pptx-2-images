@@ -129,12 +129,6 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         return response
 
-# 注意：FastAPI 中间件是反向执行的（LIFO），最后添加的中间件会最先执行
-# 所以先添加日志中间件，后添加安全中间件，这样安全中间件会先拦截可疑请求
-# 可疑请求在安全中间件中被拦截后，不会到达日志中间件，因此不会记录日志
-app.add_middleware(FilteredAccessLogMiddleware)
-app.add_middleware(SecurityMiddleware)  # 这个会先执行，拦截可疑请求
-
 # --- Custom Logging Filter ---
 
 class SecurityLogFilter:
@@ -180,6 +174,11 @@ class FilteredAccessLogMiddleware(BaseHTTPMiddleware):
         
         return response
 
+# 注意：FastAPI 中间件是反向执行的（LIFO），最后添加的中间件会最先执行
+# 所以先添加日志中间件，后添加安全中间件，这样安全中间件会先拦截可疑请求
+# 可疑请求在安全中间件中被拦截后，不会到达日志中间件，因此不会记录日志
+app.add_middleware(FilteredAccessLogMiddleware)
+app.add_middleware(SecurityMiddleware)  # 这个会先执行，拦截可疑请求
 
 # --- Utility Functions for Conversion ---
 
