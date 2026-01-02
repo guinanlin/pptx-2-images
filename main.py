@@ -4,14 +4,19 @@ import subprocess
 import tempfile
 import uuid
 import re
+import time
 from pathlib import Path
-from typing import List
+from typing import List, Set
 from zipfile import ZipFile
+from collections import defaultdict
+from datetime import datetime, timedelta
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, status
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTasks
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 from pptx import Presentation
 
 app = FastAPI(
@@ -25,6 +30,156 @@ STATIC_DIR = Path("/app/static")
 
 # Mount static files
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+
+# --- Security Configuration ---
+
+# 可疑路径黑名单（常见的扫描路径）
+SUSPICIOUS_PATHS: Set[str] = {
+    # 配置文件扫描
+    "/.env", "/.env.bak", "/.env.save", "/.env.local", "/.env.production",
+    "/backend/.env", "/admin/.env", "/api/.env",
+    "/config.php", "/config.php.bak", "/config.js", "/aws-config.js", "/aws.config.js",
+    "/wp-config.php", "/wp-config.php.old",
+    # Git 相关
+    "/.git/config", "/.git/HEAD", "/.git/",
+    # WordPress 扫描
+    "/wp-includes/", "/wp-admin/", "/xmlrpc.php",
+    "/wp-login.php", "/wp-content/",
+    # 其他常见扫描
+    "/robots.txt", "/favicon.ico",  # 这些是正常的，但频繁请求可能是扫描
+    "/.well-known/", "/.htaccess", "/.htpasswd",
+    "/phpinfo.php", "/info.php", "/test.php",
+    # 特定路径模式
+    "/js/twint_ch.js", "/js/lkk_ch.js", "/css/support_parent.css",
+}
+
+# 速率限制配置
+RATE_LIMIT_WINDOW = 60  # 时间窗口（秒）
+RATE_LIMIT_MAX_REQUESTS = 100  # 每个IP在时间窗口内的最大请求数
+RATE_LIMIT_STRICT_MAX = 20  # 严格限制：短时间内超过此数量直接拒绝
+
+# 存储每个IP的请求时间戳
+ip_request_times: defaultdict = defaultdict(list)
+ip_blocked: Set[str] = set()
+
+# --- Middleware for Security ---
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    """安全中间件：过滤可疑请求和速率限制"""
+    
+    async def dispatch(self, request: Request, call_next):
+        client_ip = request.client.host if request.client else "unknown"
+        path = request.url.path
+        method = request.method
+        
+        # 检查是否被临时封禁
+        if client_ip in ip_blocked:
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"detail": "Too many requests. Please try again later."}
+            )
+        
+        # 速率限制检查
+        current_time = time.time()
+        # 清理过期的请求记录
+        ip_request_times[client_ip] = [
+            t for t in ip_request_times[client_ip] 
+            if current_time - t < RATE_LIMIT_WINDOW
+        ]
+        
+        # 检查速率限制
+        if len(ip_request_times[client_ip]) >= RATE_LIMIT_STRICT_MAX:
+            # 短时间内请求过多，临时封禁
+            ip_blocked.add(client_ip)
+            # 30分钟后自动解封
+            def unblock():
+                time.sleep(1800)  # 30分钟
+                ip_blocked.discard(client_ip)
+            import threading
+            threading.Thread(target=unblock, daemon=True).start()
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"detail": "Rate limit exceeded. IP temporarily blocked."}
+            )
+        
+        if len(ip_request_times[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"detail": "Too many requests. Please slow down."}
+            )
+        
+        # 记录请求时间
+        ip_request_times[client_ip].append(current_time)
+        
+        # 检查可疑路径
+        is_suspicious = False
+        for suspicious_path in SUSPICIOUS_PATHS:
+            if path.startswith(suspicious_path) or suspicious_path in path:
+                is_suspicious = True
+                break
+        
+        # 对于可疑请求，直接返回404，不记录日志
+        if is_suspicious:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": "Not Found"}
+            )
+        
+        # 正常请求继续处理
+        response = await call_next(request)
+        return response
+
+# 注意：FastAPI 中间件是反向执行的（LIFO），最后添加的中间件会最先执行
+# 所以先添加日志中间件，后添加安全中间件，这样安全中间件会先拦截可疑请求
+# 可疑请求在安全中间件中被拦截后，不会到达日志中间件，因此不会记录日志
+app.add_middleware(FilteredAccessLogMiddleware)
+app.add_middleware(SecurityMiddleware)  # 这个会先执行，拦截可疑请求
+
+# --- Custom Logging Filter ---
+
+class SecurityLogFilter:
+    """自定义日志过滤器，过滤掉可疑请求的日志"""
+    
+    @staticmethod
+    def should_log(path: str, status_code: int) -> bool:
+        """判断是否应该记录日志"""
+        # 对于404的可疑路径，不记录日志
+        if status_code == 404:
+            for suspicious_path in SUSPICIOUS_PATHS:
+                if path.startswith(suspicious_path) or suspicious_path in path:
+                    return False
+        
+        # 对于频繁的健康检查请求，可以降低日志级别（这里保留，但可以调整）
+        if path in ["/", "/health"] and status_code == 200:
+            # 可以在这里添加逻辑来减少健康检查的日志
+            pass
+        
+        return True
+
+# --- Custom Access Logging Middleware ---
+
+class FilteredAccessLogMiddleware(BaseHTTPMiddleware):
+    """过滤访问日志的中间件，减少日志噪音"""
+    
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        
+        # 只记录非可疑请求的日志
+        path = request.url.path
+        status_code = response.status_code
+        client_ip = request.client.host if request.client else "unknown"
+        method = request.method
+        
+        # 判断是否应该记录日志
+        should_log = SecurityLogFilter.should_log(path, status_code)
+        
+        if should_log:
+            # 使用 print 输出日志（uvicorn 会捕获）
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"{timestamp} - {client_ip} - {method} {path} - {status_code}")
+        
+        return response
+
 
 # --- Utility Functions for Conversion ---
 
@@ -308,4 +463,14 @@ async def convert_pptx_to_jpeg(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import logging
+    
+    # 配置日志级别，减少噪音
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        access_log=False  # 禁用默认访问日志，使用自定义中间件
+    )
